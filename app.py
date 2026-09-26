@@ -4,7 +4,6 @@ import streamlit as st
 import yfinance as yf
 import requests
 import glob
-import os
 
 st.set_page_config(page_title="Dynamic RS Breakout Dashboard", layout="wide")
 
@@ -12,23 +11,30 @@ st.title("🚀 Multi-Timeframe Breakout Dashboard")
 st.write("Identifies stocks entering the Green Zone and sends alerts to Telegram.")
 
 # ==========================================
-# 1. AUTO-LOAD CSV FROM FOLDER
+# 1. FETCH TELEGRAM SECRETS
+# ==========================================
+try:
+    # Streamlit Cloud ke 'Secrets' se automatically details fetch karega
+    bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
+    chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+    telegram_ready = True
+except KeyError:
+    bot_token = ""
+    chat_id = ""
+    telegram_ready = False
+
+# ==========================================
+# 2. AUTO-LOAD CSV FROM FOLDER
 # ==========================================
 st.sidebar.header("1. Data Source")
-
-# Find all CSV files in the same folder as this script
 csv_files = glob.glob("*.csv")
 
 if not csv_files:
-    st.error("🚨 No CSV files found! Please upload your '.csv' file (e.g., 'BVVBBVBV (7).csv') to your GitHub repository alongside this script.")
+    st.error("🚨 No CSV files found! Please upload your '.csv' file to your GitHub repository alongside this script.")
     st.stop()
 
-# Auto-select the file if there's only one, or give a dropdown if there are multiple
 selected_file = st.sidebar.selectbox("Select CSV File", csv_files)
 
-# ==========================================
-# 2. INGEST DATA FROM SELECTED CSV
-# ==========================================
 @st.cache_data
 def load_csv_data(file):
     try:
@@ -51,13 +57,9 @@ if master_df.empty or 'Symbol' not in master_df.columns:
     st.stop()
 
 # ==========================================
-# 3. TELEGRAM SETTINGS & DASHBOARD FILTERS 
+# 3. DASHBOARD FILTERS 
 # ==========================================
-st.sidebar.header("2. Telegram Settings")
-bot_token = st.sidebar.text_input("Telegram Bot Token", type="password")
-chat_id = st.sidebar.text_input("Telegram Chat ID", type="password")
-
-st.sidebar.header("3. Dashboard Filters")
+st.sidebar.header("2. Dashboard Filters")
 
 if 'sector' in master_df.columns:
     clean_sectors = master_df['sector'].dropna().astype(str).unique()
@@ -83,6 +85,9 @@ if not active_symbols:
     st.warning("No stocks found for the selected filters.")
     st.stop()
 
+if not telegram_ready:
+    st.sidebar.warning("⚠️ Telegram Secrets not configured. Alerts won't send.")
+
 # ==========================================
 # 4. ENGINE (CALCULATING TODAY & 5 DAYS AGO)
 # ==========================================
@@ -107,14 +112,12 @@ def fetch_market_data(symbols):
                 current_price = series.iloc[-1]
                 daily_returns = series.pct_change() * 100
                 
-                # --- TODAY'S COMPOSITE ---
                 sum_20 = daily_returns.iloc[-20:].sum()
                 sum_60 = daily_returns.iloc[-80:-20].sum()
                 sum_80 = daily_returns.iloc[-160:-80].sum()
                 sum_90 = daily_returns.iloc[-250:-160].sum()
                 composite_today = sum_20 + sum_60 + sum_80 + sum_90
                 
-                # --- 1 WEEK AGO COMPOSITE ---
                 prev_20 = daily_returns.iloc[-25:-5].sum()
                 prev_60 = daily_returns.iloc[-85:-25].sum()
                 prev_80 = daily_returns.iloc[-165:-85].sum()
@@ -199,8 +202,8 @@ if not df.empty:
     breakouts_df = display_df[display_df["Signal"].str.contains("🚀|🔥", na=False)]
     
     if st.button("📲 Send Breakout Alerts to Telegram"):
-        if not bot_token or not chat_id:
-            st.error("Please enter both Bot Token and Chat ID in the sidebar first!")
+        if not telegram_ready:
+            st.error("❌ App Settings mein Secrets configure nahi hain. Kripya nichi diye gaye instructions follow karein.")
         elif breakouts_df.empty:
             st.info("No breakouts in this sector today to send.")
         else:
@@ -212,7 +215,7 @@ if not df.empty:
             if success:
                 st.success("✅ Alerts sent successfully to your Telegram!")
             else:
-                st.error("❌ Failed to send alerts. Please verify your Token and Chat ID.")
+                st.error("❌ Failed to send alerts. Please verify your Token and Chat ID in Streamlit Secrets.")
 
     # ----------------------------------------
     

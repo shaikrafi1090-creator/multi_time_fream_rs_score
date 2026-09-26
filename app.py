@@ -2,24 +2,32 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import yfinance as yf
+import requests
+import glob
+import os
 
 st.set_page_config(page_title="Dynamic RS Breakout Dashboard", layout="wide")
 
 st.title("🚀 Multi-Timeframe Breakout Dashboard")
-st.write("Identifies stocks entering the Green Zone based on composite daily returns (20, 60, 80, 90 days).")
+st.write("Identifies stocks entering the Green Zone and sends alerts to Telegram.")
 
 # ==========================================
-# 1. SIDEBAR FILE UPLOADER
+# 1. AUTO-LOAD CSV FROM FOLDER
 # ==========================================
-st.sidebar.header("1. Upload Data")
-uploaded_file = st.sidebar.file_uploader("Upload your sector CSV file", type=["csv"])
+st.sidebar.header("1. Data Source")
 
-if not uploaded_file:
-    st.info("👆 Please drag and drop your CSV file into the sidebar to get started.")
+# Find all CSV files in the same folder as this script
+csv_files = glob.glob("*.csv")
+
+if not csv_files:
+    st.error("🚨 No CSV files found! Please upload your '.csv' file (e.g., 'BVVBBVBV (7).csv') to your GitHub repository alongside this script.")
     st.stop()
 
+# Auto-select the file if there's only one, or give a dropdown if there are multiple
+selected_file = st.sidebar.selectbox("Select CSV File", csv_files)
+
 # ==========================================
-# 2. INGEST DATA FROM UPLOADED CSV
+# 2. INGEST DATA FROM SELECTED CSV
 # ==========================================
 @st.cache_data
 def load_csv_data(file):
@@ -36,16 +44,20 @@ def load_csv_data(file):
         st.error(f"Error reading file: {e}")
         return pd.DataFrame()
 
-master_df = load_csv_data(uploaded_file)
+master_df = load_csv_data(selected_file)
 
 if master_df.empty or 'Symbol' not in master_df.columns:
     st.error('🚨 Could not read the data. Please ensure it is a valid CSV file with a "Symbol" column.')
     st.stop()
 
 # ==========================================
-# 3. SIDEBAR FILTERS 
+# 3. TELEGRAM SETTINGS & DASHBOARD FILTERS 
 # ==========================================
-st.sidebar.header("2. Dashboard Configuration")
+st.sidebar.header("2. Telegram Settings")
+bot_token = st.sidebar.text_input("Telegram Bot Token", type="password")
+chat_id = st.sidebar.text_input("Telegram Chat ID", type="password")
+
+st.sidebar.header("3. Dashboard Filters")
 
 if 'sector' in master_df.columns:
     clean_sectors = master_df['sector'].dropna().astype(str).unique()
@@ -77,8 +89,6 @@ if not active_symbols:
 @st.cache_data(ttl=3600)
 def fetch_market_data(symbols):
     yf_symbols = [f"{sym}.NS" for sym in symbols]
-    
-    # Need 255 days to calculate a 250-day window shifted 5 days back
     hist = yf.download(yf_symbols, period="2y", interval="1d", progress=False)
     
     if "Close" in hist:
@@ -104,7 +114,7 @@ def fetch_market_data(symbols):
                 sum_90 = daily_returns.iloc[-250:-160].sum()
                 composite_today = sum_20 + sum_60 + sum_80 + sum_90
                 
-                # --- 1 WEEK AGO (5 TRADING DAYS) COMPOSITE ---
+                # --- 1 WEEK AGO COMPOSITE ---
                 prev_20 = daily_returns.iloc[-25:-5].sum()
                 prev_60 = daily_returns.iloc[-85:-25].sum()
                 prev_80 = daily_returns.iloc[-165:-85].sum()
@@ -125,7 +135,23 @@ def fetch_market_data(symbols):
     return pd.DataFrame(data)
 
 # ==========================================
-# 5. DASHBOARD RENDERING & SIGNAL LOGIC
+# 5. TELEGRAM SEND FUNCTION
+# ==========================================
+def send_telegram_alert(token, chat_id, message):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = requests.post(url, json=payload)
+        return response.status_code == 200
+    except Exception as e:
+        return False
+
+# ==========================================
+# 6. DASHBOARD RENDERING & SIGNAL LOGIC
 # ==========================================
 with st.spinner(f"Analyzing {len(active_symbols)} stocks for breakouts..."):
     df = fetch_market_data(active_symbols)
@@ -133,24 +159,18 @@ with st.spinner(f"Analyzing {len(active_symbols)} stocks for breakouts..."):
 if not df.empty:
     st.subheader(f"{selected_sector} Rankings ({selected_mcap})")
     
-    # Rank stocks by Percentile (Lower percentile = Top rank)
     df["Today Pct"] = df["Composite RS Today"].rank(pct=True, ascending=False)
     df["Prev Pct"] = df["Composite RS Prev"].rank(pct=True, ascending=False)
     
-    # Min-Max Normalization to 0-100 Score for Display
     min_rs = df["Composite RS Today"].min()
     max_rs = df["Composite RS Today"].max()
     df["Score"] = ((df["Composite RS Today"] - min_rs) / (max_rs - min_rs)) * 100 if max_rs != min_rs else 50.0
 
-    # 🚀 BREAKOUT SIGNAL LOGIC
     def get_signal(row):
-        # Was in Red (Bottom 35%), now in Green (Top 35%)
         if row["Prev Pct"] >= 0.65 and row["Today Pct"] <= 0.35:
-            return "🚀 Epic Breakout (Red to Green)"
-        # Was in Gray (Middle), now in Green (Top 35%)
+            return "🚀 Epic Breakout"
         elif row["Prev Pct"] > 0.35 and row["Today Pct"] <= 0.35:
             return "🔥 Entered Green Zone"
-        # Was in Green, dropped out
         elif row["Prev Pct"] <= 0.35 and row["Today Pct"] > 0.35:
             return "⚠️ Exited Green Zone"
         else:
@@ -164,38 +184,54 @@ if not df.empty:
     else:
         display_cols = ["Signal", "Symbol", "Current Price (₹)", "Sum 20D", "Composite RS Today", "Score"]
 
-    # Sort by the final Score
     df = df.sort_values(by="Score", ascending=False).reset_index(drop=True)
     df.index = df.index + 1  
     df.index.name = "Rank"
     
-    # Clean up numbers
     for col in ["Current Price (₹)", "Sum 20D", "Composite RS Today", "Score"]:
         df[col] = df[col].round(2)
         
     display_df = df[[col for col in display_cols if col in df.columns]]
     
-    # Color Heatmap Logic based on Today's Percentile
+    # ----------------------------------------
+    # TELEGRAM BUTTON UI
+    # ----------------------------------------
+    breakouts_df = display_df[display_df["Signal"].str.contains("🚀|🔥", na=False)]
+    
+    if st.button("📲 Send Breakout Alerts to Telegram"):
+        if not bot_token or not chat_id:
+            st.error("Please enter both Bot Token and Chat ID in the sidebar first!")
+        elif breakouts_df.empty:
+            st.info("No breakouts in this sector today to send.")
+        else:
+            msg = f"📊 *{selected_sector} Breakouts ({selected_mcap})*\n\n"
+            for _, row in breakouts_df.iterrows():
+                msg += f"{row['Signal']} *{row['Symbol']}* (₹{row['Current Price (₹)']})\n"
+            
+            success = send_telegram_alert(bot_token, chat_id, msg)
+            if success:
+                st.success("✅ Alerts sent successfully to your Telegram!")
+            else:
+                st.error("❌ Failed to send alerts. Please verify your Token and Chat ID.")
+
+    # ----------------------------------------
+    
     def apply_color_ranking(data):
         active_count = len(data)
         styles = pd.DataFrame('', index=data.index, columns=data.columns)
-        
         for i in range(active_count):
             rank = i + 1
             pct = rank / active_count
-            
             if pct <= 0.35:
                 color = "background-color: rgba(0, 128, 0, 0.4); color: white;"
             elif pct >= 0.65:
                 color = "background-color: rgba(255, 0, 0, 0.4); color: white;"
             else:
                 color = "background-color: rgba(128, 128, 128, 0.4); color: white;"
-                
             styles.iloc[i] = color
         return styles
 
     styled_df = display_df.style.apply(apply_color_ranking, axis=None)
-
     st.dataframe(styled_df, use_container_width=True, height=800)
 else:
     st.warning("Failed to retrieve sufficient market data.")
